@@ -1,0 +1,202 @@
+#!/bin/bash
+
+# Variables
+VM_USER=${vm_user}
+AZP_URL=${az_devops_url}
+AZP_TOKEN=${az_devops_pat}
+AZP_POOL=${az_devops_agentpool_name}
+AZP_AGENT_NAME=${vm_name}
+AZP_WORK="/home/$VM_USER/myagent"
+
+set -euo pipefail
+
+if [ -n "$VM_USER" ]
+then
+  echo "Virtual Machine Admin User: $VM_USER"
+else
+  echo "Error: missing AZP_URL environment variable"
+  exit 1
+fi
+ 
+if [ -n "$AZP_URL" ]
+then
+  echo "Azure DevOps URL: $AZP_URL"
+else
+  echo "Error: missing AZP_URL environment variable"
+  exit 1
+fi
+
+if [ -n "$AZP_TOKEN" ]
+then
+  echo "Azure DevOps PAT: ********"
+else
+  echo "Error: missing AZP_TOKEN environment variable"
+  exit 1
+fi
+
+if [ -n "$AZP_POOL" ]
+then
+  echo "Azure DevOps Agent Pool Name: $AZP_POOL"
+else
+  echo "Error: missing AZP_POOL environment variable"
+  exit 1
+fi
+
+if [ -n "$AZP_WORK" ]
+then
+  echo "Working Directory for Azure DevOps Agent does not Exists"
+  echo "Creating Directory $AZP_WORK"
+  mkdir -p "$AZP_WORK"
+  sudo chown -R $VM_USER:$VM_USER $AZP_WORK
+fi
+
+export AGENT_ALLOW_RUNASROOT="1"
+export DEBIAN_FRONTEND=noninteractive
+
+sleep 5m
+sudo rm -rf /var/lib/dpkg/lock-frontend
+
+echo "[INFO] Installing dependencies & basic packages"
+sudo apt-get update
+sudo apt-get upgrade -y
+sudo apt-get install -y \
+  rpm \
+  net-tools \
+  ncdu \
+  lsb-release \
+  ca-certificates \
+  curl \
+  jq \
+  git \
+  iputils-ping \
+  libcurl4 \
+  libunwind8 \
+  netcat \
+  zip \
+  unzip \
+  wget \
+  apt-transport-https \
+  gnupg \
+  gnupg-agent \
+  apt-utils \
+  software-properties-common
+
+
+echo "[INFO] Installing Docker"
+sudo install -m 0755 -d /etc/apt/keyrings
+curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+sudo chmod a+r /etc/apt/keyrings/docker.gpg
+echo \
+  "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu \
+  $(. /etc/os-release && echo "$VERSION_CODENAME") stable" | \
+  sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
+sudo apt-get update
+sudo apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+sudo usermod -aG docker $VM_USER
+#printf "{\"data-root\": \"/datadrive/docker\"}" | sudo tee -a /etc/docker/daemon.json
+
+
+echo "[INFO] Installing Aqua Trivy"
+wget -qO - https://aquasecurity.github.io/trivy-repo/deb/public.key | gpg --dearmor | sudo tee /usr/share/keyrings/trivy.gpg > /dev/null
+echo "deb [signed-by=/usr/share/keyrings/trivy.gpg] https://aquasecurity.github.io/trivy-repo/deb $(lsb_release -sc) main" | sudo tee -a /etc/apt/sources.list.d/trivy.list
+sudo apt-get update
+sudo apt-get install trivy
+
+
+
+echo "[INFO] Installing latest kubectl"
+curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl.sha256"
+sudo install -o root -g root -m 0755 kubectl /usr/local/bin/kubectl
+kubectl completion bash | sudo tee /etc/bash_completion.d/kubectl > /dev/null
+sudo chmod a+r /etc/bash_completion.d/kubectl
+source ~/.bashrc
+
+echo "[INFO] Installing helm v3 (latest)"
+curl -fsSL -o get_helm.sh https://raw.githubusercontent.com/helm/helm/master/scripts/get-helm-3
+chmod 700 get_helm.sh
+./get_helm.sh
+
+
+echo "[INFO] Installing Azure CLI"
+curl -sL https://aka.ms/InstallAzureCLIDeb | sudo bash
+
+
+echo "[INFO] Installing Azure DevOps Agent"
+cd $AZP_WORK
+
+cleanup() {
+  if [ -e config.sh ]
+  then
+    echo "Cleanup. Removing Azure Pipelines agent..."
+
+    ./config.sh remove --unattended \
+      --auth PAT \
+      --token $AZP_TOKEN
+  fi
+}
+
+run_agent() {
+  # Create run-agent.sh
+  if [ ! -f ./run-agent.sh ]
+  then
+    echo "./run-agent.sh file does not exist. Creating run-agent.sh..."
+    printf 'exec ./externals/node/bin/node ./bin/AgentService.js interactive\n' >>./run-agent.sh
+    chmod 777 ./run-agent.sh
+  else
+    echo "./run-agent.sh file already exists."
+  fi
+
+  # Schedule run-agent.sh execution to avoid a blocking call
+  at now + 1 minute -f ./run-agent.sh
+}
+
+# Let the agent ignore the token env variables
+export VSO_AGENT_IGNORE=AZP_TOKEN
+
+echo "1. Determining matching Azure Pipelines agent..."
+
+AZP_AGENT_RESPONSE=$(curl -LsS \
+  -u user:$AZP_TOKEN \
+  -H 'Accept:application/json;api-version=3.0-preview' \
+  "$AZP_URL/_apis/distributedtask/packages/agent?platform=linux-x64")
+
+if echo "$AZP_AGENT_RESPONSE" | jq . >/dev/null 2>&1
+then
+  AZP_AGENTPACKAGE_URL=$(echo "$AZP_AGENT_RESPONSE" |
+    jq -r '.value | map([.version.major,.version.minor,.version.patch,.downloadUrl]) | sort | .[length-1] | .[3]')
+fi
+
+echo "AZP_AGENT_RESPONSE: $AZP_AGENT_RESPONSE" | tee /dev/stderr 
+echo "AZP_AGENTPACKAGE_URL: $AZP_AGENTPACKAGE_URL" | tee /dev/stderr 
+
+if [ -z "$AZP_AGENTPACKAGE_URL" -o "$AZP_AGENTPACKAGE_URL" == "null" ]
+then
+  echo 1>&2 "error: could not determine a matching Azure Pipelines agent - check that account '$AZP_URL' is correct and the token is valid for that account"
+  exit 1
+fi
+
+echo "2. Downloading and installing Azure Pipelines agent..."
+sudo chown -R $VM_USER:$VM_USER $AZP_WORK
+curl -LsS $AZP_AGENTPACKAGE_URL | tar -xz &
+wait $!
+
+
+echo "3. Configuring Azure Pipelines agent..."
+
+./config.sh --unattended \
+  --agent "$AZP_AGENT_NAME" \
+  --url "$AZP_URL" \
+  --auth PAT \
+  --token "$AZP_TOKEN" \
+  --pool "$AZP_POOL" \
+  --replace \
+  --acceptTeeEula &
+wait $!
+
+echo "4. Installing & Starting Azure Pipelines agent Service..."
+sudo ./svc.sh install
+sudo ./svc.sh start
+
+echo "5. Running Azure Pipelines agent..."
+run_agent

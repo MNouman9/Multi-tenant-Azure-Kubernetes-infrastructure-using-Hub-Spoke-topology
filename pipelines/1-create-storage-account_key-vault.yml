@@ -1,0 +1,20 @@
+trigger:
+- none
+
+pool:
+  vmImage: ubuntu-latest
+
+steps:
+- task: AzureCLI@2
+  inputs:
+    azureSubscription: 'olx-azure-terraform-state'
+    scriptType: 'bash'
+    scriptLocation: 'scriptPath'
+    scriptPath: '../pre-deployment-resources/storage-account/create-storage-account.sh'
+
+- task: AzureCLI@2
+  inputs:
+    azureSubscription: 'olx-azure-terraform-state'
+    scriptType: 'bash'
+    scriptLocation: 'scriptPath'
+    scriptPath: '../pre-deployment-resources/key-vault/create-key-vault-and-secrets.sh'
